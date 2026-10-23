@@ -25,8 +25,8 @@ from theme import apply_dropdown_delegate
 from gui.network.network_diagnostics import (
     NetworkScanner, get_local_subnet_info, compute_scan_network, parse_custom_scan_range,
 )
-from gui.diagnostics.serial_discovery import (
-    SerialParamScanWorker, detect_serial_ports, PARITY_LABELS,
+from diagnostics.serial_discovery import (
+    SerialParamScanWorker, SerialScanOptions, detect_serial_ports, PARITY_LABELS,
 )
 
 TCP_ROW = "tcp"
@@ -82,7 +82,7 @@ class FindDevicesDialog:
         c = self.parent._colors()
         self.dialog = QDialog(self.parent)
         self.dialog.setWindowTitle("Find Devices")
-        self.dialog.setGeometry(300, 300, 660, 560)
+        self.dialog.setGeometry(300, 300, 900, 680)
         self.dialog.closeEvent = self._on_dialog_close
 
         layout = QVBoxLayout(self.dialog)
@@ -130,8 +130,8 @@ class FindDevicesDialog:
 
         # Shared results table
         layout.addWidget(QLabel("Found devices (select one, then Apply):"))
-        self.results_table = QTableWidget(0, 4)
-        self.results_table.setHorizontalHeaderLabels(["Transport", "Target", "Parameters", "Unit ID"])
+        self.results_table = QTableWidget(0, 5)
+        self.results_table.setHorizontalHeaderLabels(["Transport", "Target", "Parameters", "Unit ID", "Evidence"])
         self.results_table.setStyleSheet(f"""
             QTableWidget {{
                 background-color: {c["surface"]};
@@ -144,6 +144,7 @@ class FindDevicesDialog:
         self.results_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.results_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.results_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.results_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
         self.results_table.itemSelectionChanged.connect(self._on_selection_changed)
         self.results_table.doubleClicked.connect(lambda _idx: self._apply_selected())
         self.results_table.setMaximumHeight(160)
@@ -183,7 +184,7 @@ class FindDevicesDialog:
         button_row.addStretch()
         close_btn = QPushButton("Close")
         close_btn.setStyleSheet(self.parent._get_button_style())
-        close_btn.clicked.connect(self.dialog.hide)
+        close_btn.clicked.connect(self.dialog.close)
         button_row.addWidget(close_btn)
         layout.addLayout(button_row)
 
@@ -245,24 +246,28 @@ class FindDevicesDialog:
         row2.addWidget(QLabel("Start Unit ID:"))
         self.start_unit_input = QSpinBox()
         self.start_unit_input.setStyleSheet(self.parent._get_input_style())
-        self.start_unit_input.setRange(0, 255)
+        self.start_unit_input.setRange(1, 247)
         self.start_unit_input.setValue(1)
         row2.addWidget(self.start_unit_input)
 
         row2.addWidget(QLabel("End Unit ID:"))
         self.end_unit_input = QSpinBox()
         self.end_unit_input.setStyleSheet(self.parent._get_input_style())
-        self.end_unit_input.setRange(0, 255)
+        self.end_unit_input.setRange(1, 247)
         self.end_unit_input.setValue(1)
         row2.addWidget(self.end_unit_input)
 
-        row2.addWidget(QLabel("Per-trial timeout (ms):"))
+        row2.addWidget(QLabel("Reply wait (ms):"))
         self.timeout_input = QSpinBox()
         self.timeout_input.setStyleSheet(self.parent._get_input_style())
         self.timeout_input.setRange(50, 2000)
         self.timeout_input.setValue(200)
+        self.timeout_input.setToolTip("Device response allowance. Request/reply wire time is added automatically, especially for low baud rates.")
         row2.addWidget(self.timeout_input)
         grid.addLayout(row2)
+
+        self.serial_scan_options = SerialScanOptions(self.parent)
+        grid.addWidget(self.serial_scan_options)
 
         return panel
 
@@ -339,18 +344,27 @@ class FindDevicesDialog:
             self.output_text.append("Error: Start Unit ID must not be greater than End Unit ID.")
             return
 
-        self.output_text.append(f"Scanning serial settings on {port}...")
+        try:
+            options = self.serial_scan_options.scan_options()
+        except ValueError as exc:
+            self.output_text.append(f"Error: {exc}")
+            return
+
+        combinations = len(options["baud_rates"]) * 6 * (end_unit - start_unit + 1)
+        self.output_text.append(f"Scanning serial settings on {port} ({combinations} combinations; "
+                                f"{options['confirmation_count']} replies required per match)...")
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.transport_combo.setEnabled(False)
+        self.input_stack.setEnabled(False)
 
         self.serial_worker = SerialParamScanWorker(
             port, self.framer_combo.currentText().lower(), start_unit, end_unit,
-            self.timeout_input.value() / 1000.0,
+            self.timeout_input.value() / 1000.0, **options,
         )
-        self.serial_worker.combo_matched.connect(self._on_serial_combo_matched)
+        self.serial_worker.combo_evidence.connect(self._on_serial_combo_evidence)
         self.serial_worker.progress.connect(self.progress_bar.setValue)
         self.serial_worker.output.connect(self.output_text.append)
         self.serial_worker.scan_complete.connect(self._on_scan_complete)
@@ -370,30 +384,37 @@ class FindDevicesDialog:
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.transport_combo.setEnabled(True)
+        self.input_stack.setEnabled(True)
 
     def _on_tcp_device_found(self, ip, port, status):
         self._add_result_row(TCP_ROW, f"{ip}:{port}", "Modbus confirmed", "-",
                               data={"ip": ip, "port": int(port)})
 
-    def _on_serial_combo_matched(self, baud, parity, stopbits, unit_id):
-        port = self.port_combo.currentText().strip()
-        framer_value = self.framer_combo.currentText().lower()
+    def _on_serial_combo_evidence(self, evidence):
+        port, framer_value = evidence["serial_port"], evidence["framer"]
+        baud, parity, stopbits, unit_id = (evidence[key] for key in ("baudrate", "parity", "stopbits", "unit_id"))
         parity_label = PARITY_LABELS.get(parity, parity)
-        params = f"{baud} baud, {parity_label} parity, 8/{stopbits}, {self.framer_combo.currentText()}"
+        params = f"{baud} baud, {parity_label} parity, 8/{stopbits}, {framer_value.upper()}"
         self._add_result_row(SERIAL_ROW, port, params, str(unit_id), data={
             "serial_port": port, "baudrate": baud, "parity": parity,
             "stopbits": stopbits, "unit_id": unit_id, "framer": framer_value,
-        })
+        }, evidence=evidence)
 
-    def _add_result_row(self, kind, target, params, unit_id_text, data):
+    def _add_result_row(self, kind, target, params, unit_id_text, data, evidence=None):
         row = self.results_table.rowCount()
         self.results_table.insertRow(row)
         transport_item = QTableWidgetItem("TCP" if kind == TCP_ROW else "Serial")
         transport_item.setData(Qt.UserRole, (kind, data))
+        transport_item.setData(Qt.UserRole + 1, evidence or {})
         self.results_table.setItem(row, 0, transport_item)
         self.results_table.setItem(row, 1, QTableWidgetItem(target))
         self.results_table.setItem(row, 2, QTableWidgetItem(params))
         self.results_table.setItem(row, 3, QTableWidgetItem(unit_id_text))
+        evidence_item = QTableWidgetItem(evidence["summary"] if evidence else "Protocol response")
+        if evidence:
+            evidence_item.setToolTip(f"FC{evidence['function_code']:02d}, PDU address {evidence['probe_address']}; "
+                                     f"registers {evidence['registers']}; TX {evidence['tx_hex']}; RX {evidence['rx_hex']}")
+        self.results_table.setItem(row, 4, evidence_item)
         self.export_btn.setEnabled(True)
 
     def _clear_results(self):
@@ -404,14 +425,20 @@ class FindDevicesDialog:
 
     def _export_results_csv(self):
         table = self.results_table
-        rows = [[table.item(r, c).text() if table.item(r, c) else "" for c in range(table.columnCount())]
-                for r in range(table.rowCount())]
+        rows = []
+        detail_keys = ("function_code", "probe_address", "confirmations", "registers", "exception_codes", "tx_hex", "rx_hex")
+        for row in range(table.rowCount()):
+            evidence = table.item(row, 0).data(Qt.UserRole + 1) or {}
+            rows.append([table.item(row, column).text() if table.item(row, column) else ""
+                         for column in range(table.columnCount())]
+                        + [evidence.get(key, "") for key in detail_keys])
         if not rows:
             return
         from gui.csv_export import export_rows_csv
         export_rows_csv(
             self.dialog, "Export Found Devices", "found_devices",
-            ["Transport", "Target", "Parameters", "Unit ID"], rows,
+            ["Transport", "Target", "Parameters", "Unit ID", "Evidence", "Function Code", "PDU Address",
+             "Confirmed Replies", "Last Data Registers", "Exception Codes", "Last TX Hex", "Last RX Hex"], rows,
             log=getattr(self.parent, "_log", None),
         )
 
@@ -427,6 +454,7 @@ class FindDevicesDialog:
             return
         row = items[0].row()
         kind, data = self.results_table.item(row, 0).data(Qt.UserRole)
+        self.stop_all_scans()
         if self._pick_mode:
             self._picked = (kind, data)
             self.dialog.accept()

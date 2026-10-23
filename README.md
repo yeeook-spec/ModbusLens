@@ -58,6 +58,54 @@
 
 ---
 
+## Field troubleshooting workflow (this fork)
+
+1. Open **Diagnostics > Find Devices**, select **Serial**, and choose the COM port.
+   Enter the baud rates to try and the Unit ID range (1-247). RTU scans try each
+   requested baud with N/E/O parity and 1/2 stop bits, using 8 data bits.
+2. Select a read-only **FC03** (holding) or **FC04** (input) probe and its exact
+   zero-based PDU address. Require 2-5 valid replies per match. **Readable data**
+   means every confirmation returned a complete register; **Protocol replies**
+   can include exceptions and establish communication only. Values may change
+   between confirmations. Reply wait includes an additional serial wire-time
+   allowance so low baud rates are not rejected simply for taking longer to transmit.
+3. Apply a chosen result to Device Settings and connect. In **Scanner**, choose
+   Holding Registers or Input Registers and a section, or the full 0-65535 protocol
+   address range. **Document (1-based)** accepts 1-65536 and subtracts one exactly
+   once. These inputs are addresses within the selected space, not 4xxxx/3xxxx numbers.
+   Only values exposed through Modbus can be scanned; internal PLC tags are not discoverable this way.
+4. Leave **Capture neighbours for offset/type analysis** selected to read up to two
+   extra words below and three above the nominal range. This covers offsets -2,-1,0,+1,+2
+   and a second word for 32-bit values. The actual read range is logged; extra words
+   are marked Neighbour in CSV and excluded from Create Tags.
+5. Select **Interpret Values** after a complete or stopped scan. Each nominal address
+   is interpreted at all five offsets as F32 by default; choose All types to also
+   compare U16/S16/U32/S32. Two-word interpretations compare ABCD, CDAB, BADC, and
+   DCBA byte order. Exact PDU addresses, raw words, values, scores and reasons remain visible.
+   Set expected minimum/maximum values to help prioritize candidates; bounds apply
+   before engineering scaling. Pages cover 25 nominal addresses, and CSV export
+   includes the current page and active filters. Scanner CSV exports the full raw capture.
+
+These scans issue reads only. Run as the only active Modbus master on an RTU bus;
+stop other masters/polling first. Discovery requires the COM port to be disconnected
+in ModbusLens. A full unknown address-space scan can be slow; use Stop to retain
+completed reads and Max block to accommodate devices with smaller read limits.
+Inconclusive results include timeouts, incomplete replies, busy and device failures.
+Only exceptions 02/03 identify rejected individual reads; other device exceptions
+do not prove an address is invalid. Missing words are never fabricated or joined
+across a gap. Reads are sequential, so words captured in separate requests need not
+represent the same instant.
+
+Scores are heuristic inspection priorities, not probabilities or confirmation of a
+tag's type, offset, byte order, units or scaling. Zero, all-ones, subnormal, extreme
+and non-finite interpretations receive explicit explanations. Confirm candidates
+against the device register map and known process values before using them.
+
+Run the offline and local loopback checks with `python -m unittest discover -s tests -v`.
+Physical RS485/RTU baud detection, adapter quirks and live PLC acceptance still require hardware testing.
+Protocol references: [Modbus Application Protocol V1.1b3](https://www.modbus.org/file/secure/modbusprotocolspecification.pdf)
+and [Modbus over Serial Line V1.02](https://www.modbus.org/file/secure/modbusoverserial.pdf).
+
 ## Screenshots
 
 ### Overview - Multiple Devices
