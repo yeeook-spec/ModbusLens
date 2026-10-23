@@ -17,13 +17,13 @@ from widgets.device_selector import DeviceSelector
 # own red/green never changes with Windows' theme.
 _PALETTE_STANDARD = {
     "ok": (QColor("#C6EFCE"), QColor("#006100"), "responds"),
-    "bad": (QColor("#FFC7CE"), QColor("#9C0006"), "no response"),
+    "bad": (QColor("#FFC7CE"), QColor("#9C0006"), "read rejected (exception 02/03)"),
 }
 # Blue/orange instead of green/red -- the classic colorblind-safe substitute (still
 # distinguishable under deuteranopia, protanopia and tritanopia, unlike red/green).
 _PALETTE_COLORBLIND = {
     "ok": (QColor("#BFE1F5"), QColor("#003C64"), "responds"),
-    "bad": (QColor("#FFE1B3"), QColor("#7A4A00"), "no response"),
+    "bad": (QColor("#FFE1B3"), QColor("#7A4A00"), "read rejected (exception 02/03)"),
 }
 # A third status, for an address that timed out even after narrowing to one at a time (a
 # flaky link's fault, not a confirmed answer either way). Excel's own "Neutral" amber is
@@ -31,9 +31,9 @@ _PALETTE_COLORBLIND = {
 # "bad" is already an orange, which that same amber sits too close to, so colorblind mode
 # gets a plain gray third color instead, unmistakable from both its blue and its orange.
 _TIMEOUT_COLOR_STANDARD = (QColor("#FFEB9C"), QColor("#9C6500"),
-                           "no response (timeout) -- inconclusive, try scanning it again")
+                           "inconclusive: timeout, incomplete reply or device exception; see log")
 _TIMEOUT_COLOR_COLORBLIND = (QColor("#D9D9D9"), QColor("#404040"),
-                             "no response (timeout) -- inconclusive, try scanning it again")
+                             "inconclusive: timeout, incomplete reply or device exception; see log")
 
 # Target cell size for working out how many addresses fit one Excel-like "sheet" page at
 # the grid's current on-screen size -- a page's actual columns still stretch evenly to
@@ -113,14 +113,16 @@ class AddressScanWorker(QThread):
     mostly-contiguous register map, while still resolving individually where it matters."""
 
     range_found = Signal(int, int)  # start, count -- a confirmed contiguous responding run
-    range_not_responding = Signal(int)  # address -- a single address confirmed not to respond
+    registers_found = Signal(int, list)  # start, exact raw register values
+    range_exception = Signal(int, int)  # single address, exception 02/03
+    range_not_responding = Signal(int)  # address -- single read rejected by exception 02/03
     range_inconclusive = Signal(int)  # address -- timed out even after narrowing to one address
     progress = Signal(int)  # 0-100
     output = Signal(str)
     scan_complete = Signal(int, int, int)  # responding_count, probes_issued, inconclusive_count
 
     def __init__(self, modbus, function_name, start_address, end_address, probe_timeout,
-                 reserve_range=None, release_range=None):
+                 reserve_range=None, release_range=None, block_size=None):
         super().__init__()
         self.modbus = modbus
         self.function_name = function_name
@@ -129,6 +131,7 @@ class AddressScanWorker(QThread):
         self.start_address = start_address
         self.end_address = end_address  # inclusive
         self.probe_timeout = probe_timeout
+        self.block_size = min(_MAX_BLOCK[function_name], max(1, block_size or _MAX_BLOCK[function_name]))
         # Default to permissive no-ops so this stays usable standalone (e.g. in tests)
         # without a real main window -- same pattern ScriptRunner already uses.
         self.reserve_range = reserve_range or (lambda request_range: True)
@@ -140,9 +143,8 @@ class AddressScanWorker(QThread):
 
     def run(self):
         total = self.end_address - self.start_address + 1
-        max_block = _MAX_BLOCK[self.function_name]
-        original_timeout = self.modbus.get_timeout()
-        self.modbus.set_timeout(self.probe_timeout)
+        max_block = self.block_size
+        original_timeout = None
 
         responding = 0
         probes = 0
@@ -150,6 +152,8 @@ class AddressScanWorker(QThread):
         inconclusive = 0
         aborted = False
         try:
+            original_timeout = self.modbus.get_timeout()
+            self.modbus.set_timeout(self.probe_timeout)
             pending = deque()
             addr = self.start_address
             while addr <= self.end_address:
@@ -191,10 +195,15 @@ class AddressScanWorker(QThread):
                     self.release_range(request_range)
                 self.msleep(PROBE_DELAY_MS)
 
-                if result is not None:
+                valid = (isinstance(result, (list, tuple)) and len(result) == count)
+                if valid and self.function_name in ("Holding Registers", "Input Registers"):
+                    valid = all(type(word) is int and 0 <= word <= 65535 for word in result)
+                if valid:
                     responding += count
                     resolved += count
                     self.range_found.emit(block_start, count)
+                    if self.function_name in ("Holding Registers", "Input Registers"):
+                        self.registers_found.emit(block_start, list(result))
                 elif self.modbus.last_exception_code == _ILLEGAL_FUNCTION:
                     self.output.emit(
                         f"{self.function_name} is not supported by this device "
@@ -202,14 +211,11 @@ class AddressScanWorker(QThread):
                     )
                     aborted = True
                     break
-                elif self.modbus.last_exception_code is not None:
-                    # Any other exception -- Illegal Data Address, Illegal Data Value, or
-                    # a non-compliant device's own error code for "not here" -- means this
-                    # block isn't fully readable, not that the device stopped responding.
-                    # Keep narrowing rather than treating it as fatal.
+                elif self.modbus.last_exception_code in (2, 3):
                     if count == 1:
                         resolved += 1  # confirmed: this single address doesn't respond
                         self.range_not_responding.emit(block_start)
+                        self.range_exception.emit(block_start, self.modbus.last_exception_code)
                     else:
                         left = count // 2
                         pending.appendleft((block_start + left, count - left))
@@ -222,6 +228,14 @@ class AddressScanWorker(QThread):
                     )
                     aborted = True
                     break
+                elif self.modbus.last_exception_code is not None:
+                    # Busy, device failure and gateway errors do not establish whether
+                    # this address is readable. Do not paint them as rejected addresses.
+                    resolved += count
+                    inconclusive += count
+                    self.output.emit(f"Exception {self.modbus.last_exception_code} at {block_start}-{block_start + count - 1}: inconclusive.")
+                    for address in range(block_start, block_start + count):
+                        self.range_inconclusive.emit(address)
                 else:
                     # A genuine I/O timeout with no exception code -- the device didn't
                     # answer at all, not even with an error. On a flaky link (e.g. an
@@ -237,7 +251,7 @@ class AddressScanWorker(QThread):
                         resolved += 1
                         inconclusive += 1
                         self.output.emit(
-                            f"No response from address {block_start} after retries -- "
+                            f"No complete read from address {block_start} -- "
                             "marked inconclusive, continuing."
                         )
                         self.range_inconclusive.emit(block_start)
@@ -247,12 +261,19 @@ class AddressScanWorker(QThread):
                         pending.appendleft((block_start, left))
 
                 self.progress.emit(int(resolved / total * 100) if total else 100)
+        except Exception as exc:
+            aborted = True
+            self.output.emit(f"Scan failed: {exc}")
         finally:
-            self.modbus.set_timeout(original_timeout)
-
-        if not aborted:
-            self.output.emit("Scan stopped." if self.should_stop else "Scan complete.")
-        self.scan_complete.emit(responding, probes, inconclusive)
+            try:
+                if original_timeout is not None:
+                    self.modbus.set_timeout(original_timeout)
+            except Exception as exc:
+                self.output.emit(f"Could not restore scan timeout: {exc}")
+            finally:
+                if not aborted:
+                    self.output.emit("Scan stopped." if self.should_stop else "Scan complete.")
+                self.scan_complete.emit(responding, probes, inconclusive)
 
 
 def _merge_ranges(ranges):
@@ -332,6 +353,8 @@ class RegisterScannerWidget(QWidget):
         self.parent_window = parent
         self.address_worker = None
         self._found_ranges = []
+        self._raw_registers = {}
+        self._exception_codes = {}
         self._cell_font_px = _GRID_DEFAULT_FONT_PX
         self._colorblind = False
         self._scan_range = None  # (start, end) of the last prepared/run scan, for repagination
@@ -377,6 +400,28 @@ class RegisterScannerWidget(QWidget):
         self.addr_end_input.setValue(999)
         row1.addWidget(self.addr_end_input)
         control_layout.addLayout(row1)
+
+        address_row = QHBoxLayout()
+        address_row.addWidget(QLabel("Address basis:"))
+        self.address_basis_combo = QComboBox()
+        self.address_basis_combo.addItems(["Protocol (0-based)", "Document (1-based)"])
+        self.address_basis_combo.currentIndexChanged.connect(self._on_address_basis_changed)
+        address_row.addWidget(self.address_basis_combo)
+        self.analysis_capture_checkbox = QCheckBox("Capture neighbours for offset/type analysis")
+        self.analysis_capture_checkbox.setChecked(True)
+        self.analysis_capture_checkbox.setToolTip(
+            "Read up to 2 extra registers below and 3 above the nominal range for offsets -2..+2 and two-register values."
+        )
+        address_row.addWidget(self.analysis_capture_checkbox)
+        address_row.addWidget(QLabel("Max block:"))
+        self.block_size_input = QSpinBox()
+        self.block_size_input.setRange(1, 125)
+        self.block_size_input.setValue(125)
+        self.block_size_input.setToolTip("Maximum addresses per request. Lower this for devices with smaller read limits.")
+        address_row.addWidget(self.block_size_input)
+        address_row.addStretch()
+        control_layout.addLayout(address_row)
+        self.addr_function_combo.currentTextChanged.connect(self._update_analysis_controls)
 
         row2 = QHBoxLayout()
         row2.addWidget(QLabel("Probe timeout (ms):"))
@@ -432,11 +477,20 @@ class RegisterScannerWidget(QWidget):
         self.export_btn = QPushButton("Export CSV...")
         self.export_btn.setStyleSheet(self.parent_window._get_button_style())
         self.export_btn.setEnabled(False)
-        self.export_btn.setToolTip("Save every address this scan resolved (responds / no response / timeout) to a CSV file")
+        self.export_btn.setToolTip("Export captured raw words, exact addresses, read status and exception codes to CSV")
         self.export_btn.clicked.connect(self._export_results_csv)
         row2.addWidget(self.export_btn)
         control_layout.addLayout(row2)
         layout.addWidget(control_group)
+
+        interpretation_row = QHBoxLayout()
+        interpretation_row.addWidget(QLabel("Reads only. Scan 0-65535 for a full Modbus address space, or choose a section."))
+        interpretation_row.addStretch()
+        self.analyze_btn = QPushButton("Interpret Values...")
+        self.analyze_btn.setEnabled(False)
+        self.analyze_btn.clicked.connect(self._show_register_analysis)
+        interpretation_row.addWidget(self.analyze_btn)
+        layout.addLayout(interpretation_row)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
@@ -449,8 +503,8 @@ class RegisterScannerWidget(QWidget):
         self._legend_swatches = {}
         for status, text in (
             ("ok", "Responds"),
-            ("bad", "No response"),
-            ("timeout", "Timeout (inconclusive)"),
+            ("bad", "Read rejected (02/03)"),
+            ("timeout", "Inconclusive"),
         ):
             swatch = QLabel()
             swatch.setFixedSize(14, 14)
@@ -652,6 +706,8 @@ class RegisterScannerWidget(QWidget):
     def _clear_results(self):
         """Clear the result grid, its page tabs, and any ranges the last scan found."""
         self._found_ranges = []
+        self._raw_registers = {}
+        self._exception_codes = {}
         self.result_grid.setRowCount(0)
         self.result_grid.setColumnCount(0)
         self._grid_items = {}
@@ -664,6 +720,7 @@ class RegisterScannerWidget(QWidget):
         self.page_tabbar.blockSignals(False)
         self.create_tags_btn.setEnabled(False)
         self.export_btn.setEnabled(False)
+        self.analyze_btn.setEnabled(False)
 
     def _export_results_csv(self):
         """One row per address the scan resolved, in address order -- the same statuses
@@ -673,17 +730,21 @@ class RegisterScannerWidget(QWidget):
         from gui.csv_export import export_rows_csv
         device = getattr(self, "_scanned_device", None) or self.device_selector.device() or ""
         record = self.parent_window._device(device) if device else None
-        unit = record["unit"] if record else ""
+        unit = getattr(self, "_scanned_unit", record["unit"] if record else "")
         function_name = getattr(self, "_scanned_function", None) or self.addr_function_combo.currentText()
-        one_based = getattr(self.parent_window, "tag_address_one_based", True)
-        labels = {"ok": "Responds", "bad": "No response", "timeout": "Timeout (inconclusive)"}
+        one_based = getattr(self, "_scanned_one_based", False)
+        labels = {"ok": "Readable", "bad": "Read rejected", "timeout": "Inconclusive"}
         rows = [
-            [device, unit, function_name, address, address + (1 if one_based else 0), labels.get(status, status)]
+            [device, unit, function_name, address, address + (1 if one_based else 0), labels.get(status, status),
+             self._exception_codes.get(address, ""), self._raw_registers.get(address, ""),
+             f"{self._raw_registers[address]:04X}" if address in self._raw_registers else "",
+             "Nominal" if self._nominal_range[0] <= address <= self._nominal_range[1] else "Neighbour"]
             for address, status in sorted(self._address_status.items())
         ]
         export_rows_csv(
             self, "Export Scanner Results", "scanner_results",
-            ["Device", "Unit ID", "Function", "Protocol Address", "Tag Address", "Status"],
+            ["Device", "Unit ID", "Function", "Protocol Address", "Reference Address", "Status",
+             "Exception Code", "Raw U16", "Raw Hex", "Scope"],
             rows, log=self._log,
         )
 
@@ -691,10 +752,41 @@ class RegisterScannerWidget(QWidget):
         """The device picked in this tab's Device selector (None while it's offline)."""
         return self.device_selector.modbus()
 
+    def _scan_controls(self):
+        return (self.addr_function_combo, self.addr_start_input, self.addr_end_input,
+                self.addr_timeout_input, self.address_basis_combo,
+                self.analysis_capture_checkbox, self.block_size_input)
+
+    def _on_address_basis_changed(self, index):
+        # Preserve the same protocol range when changing display convention.
+        delta = 1 if index == 1 else -1
+        start, end = self.addr_start_input.value(), self.addr_end_input.value()
+        for control, value in ((self.addr_start_input, start), (self.addr_end_input, end)):
+            control.setRange(index, 65535 + index)
+            control.setValue(value + delta)
+
+    def _update_analysis_controls(self, *_args):
+        registers = self.addr_function_combo.currentText() in ("Holding Registers", "Input Registers")
+        self.analysis_capture_checkbox.setEnabled(registers and not self._scan_in_progress())
+        self.block_size_input.setMaximum(125 if registers else 2000)
+
+    def _show_register_analysis(self):
+        if not self._raw_registers:
+            return
+        from gui.diagnostics.register_analysis_dialog import RegisterAnalysisDialog
+        start, end = self._nominal_range
+        dialog = RegisterAnalysisDialog(
+            self._raw_registers, start, end, device=self._scanned_device or "",
+            unit=self._scanned_unit, function_name=self._scanned_function,
+            one_based=self._scanned_one_based, parent=self,
+        )
+        dialog.exec()
+
     def refresh_connection_state(self):
         modbus = self._modbus()
         connected = bool(modbus and modbus.is_connected())
         in_progress = self._scan_in_progress()
+        self._update_analysis_controls()
         self.addr_start_btn.setEnabled(connected and not in_progress)
         self.device_selector.combo.setEnabled(not in_progress)
         name = self.device_selector.device() or "the device"
@@ -759,17 +851,27 @@ class RegisterScannerWidget(QWidget):
             self._log("A script is currently running -- stop it before starting a scan.")
             return
 
-        start = self.addr_start_input.value()
-        end = self.addr_end_input.value()
+        one_based = self.address_basis_combo.currentIndex() == 1
+        start = self.addr_start_input.value() - int(one_based)
+        end = self.addr_end_input.value() - int(one_based)
         if start > end:
             self._log("Start address must not be greater than End address.")
             return
 
         self._pause_shared_connection_monitoring()
         self._found_ranges = []
-        self._prepare_scan_pages(start, end)
+        self._raw_registers = {}
+        self._exception_codes = {}
+        self._nominal_range = (start, end)
+        self._scanned_one_based = one_based
+        self._scanned_unit = modbus.unit_id
+        capture = self.analysis_capture_checkbox.isEnabled() and self.analysis_capture_checkbox.isChecked()
+        read_start = max(0, start - 2) if capture else start
+        read_end = min(65535, end + 3) if capture else end
+        self._prepare_scan_pages(read_start, read_end)
         self._log(
-            f"Scanning {self.addr_function_combo.currentText()} {start}-{end}..."
+            f"Scanning {self.addr_function_combo.currentText()} PDU {start}-{end}; "
+            f"actual read range {read_start}-{read_end} (includes analysis neighbours when selected)."
         )
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
@@ -777,22 +879,30 @@ class RegisterScannerWidget(QWidget):
         self.addr_stop_btn.setEnabled(True)
         self.create_tags_btn.setEnabled(False)
         self.export_btn.setEnabled(False)
+        self.analyze_btn.setEnabled(False)
+        self.clear_results_btn.setEnabled(False)
+        for control in self._scan_controls():
+            control.setEnabled(False)
 
         self._scanned_device = self.device_selector.device()
         self._scanned_function = self.addr_function_combo.currentText()
         self.device_selector.combo.setEnabled(False)
         self.address_worker = AddressScanWorker(
-            modbus, self.addr_function_combo.currentText(), start, end,
+            modbus, self.addr_function_combo.currentText(), read_start, read_end,
             self.addr_timeout_input.value() / 1000.0,
             reserve_range=getattr(self.parent_window, "_reserve_range", None),
             release_range=getattr(self.parent_window, "_release_range", None),
+            block_size=self.block_size_input.value(),
         )
         self.address_worker.range_found.connect(self._on_address_range_found)
+        self.address_worker.registers_found.connect(self._on_registers_found)
+        self.address_worker.range_exception.connect(self._on_range_exception)
         self.address_worker.range_not_responding.connect(self._on_address_range_not_responding)
         self.address_worker.range_inconclusive.connect(self._on_address_range_inconclusive)
         self.address_worker.progress.connect(self.progress_bar.setValue)
         self.address_worker.output.connect(self._log)
         self.address_worker.scan_complete.connect(self._on_address_scan_complete)
+        self.address_worker.finished.connect(self.refresh_connection_state)
         self.address_worker.start()
 
     def _stop_address_scan(self):
@@ -800,8 +910,17 @@ class RegisterScannerWidget(QWidget):
             self.address_worker.stop()
 
     def _on_address_range_found(self, start, count):
-        self._found_ranges.append((start, count))
+        first, last = self._nominal_range
+        clipped_start, clipped_end = max(start, first), min(start + count - 1, last)
+        if clipped_start <= clipped_end:
+            self._found_ranges.append((clipped_start, clipped_end - clipped_start + 1))
         self._color_grid_range(start, count, responding=True)
+
+    def _on_registers_found(self, start, words):
+        self._raw_registers.update((start + index, word) for index, word in enumerate(words))
+
+    def _on_range_exception(self, address, code):
+        self._exception_codes[address] = code
 
     def _on_address_range_not_responding(self, address):
         self._color_grid_range(address, 1, responding=False)
@@ -821,17 +940,23 @@ class RegisterScannerWidget(QWidget):
         merged = _merge_ranges(self._found_ranges)
         if merged:
             summary = ", ".join(f"{s}" if s == e else f"{s}-{e}" for s, e in merged)
-            self._log(f"Summary: {responding_count} responding address(es): {summary}")
+            nominal_count = sum(end - start + 1 for start, end in merged)
+            self._log(f"Summary: {nominal_count} readable nominal address(es): {summary}")
         else:
             self._log("Summary: no responding addresses found in range.")
         if inconclusive_count:
             self._log(
-                f"{inconclusive_count} address(es) timed out even after retries (amber in the "
-                "grid) -- likely a flaky link; try scanning that narrow range again."
+                f"{inconclusive_count} address(es) are inconclusive: timeout, incomplete reply, "
+                "or device exception. Inspect the log and scan a narrower range if needed."
             )
-        self._log(f"({probes_issued} request(s) issued)")
+        self._log(f"({probes_issued} request(s); {responding_count} readable addresses including captured neighbours)")
         self.progress_bar.setVisible(False)
         self.addr_stop_btn.setEnabled(False)
+        self.clear_results_btn.setEnabled(True)
+        for control in self._scan_controls():
+            control.setEnabled(True)
+        self._update_analysis_controls()
+        self.analyze_btn.setEnabled(bool(self._raw_registers))
         self.create_tags_btn.setEnabled(bool(merged))
         self.refresh_connection_state()
 

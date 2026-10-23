@@ -1,7 +1,10 @@
+from math import ceil
+from threading import Lock
+
 from PySide6.QtCore import QThread, Signal, Qt
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTextEdit,
-    QComboBox, QSpinBox, QProgressBar, QListWidget, QListWidgetItem,
+    QComboBox, QSpinBox, QProgressBar, QListWidget, QListWidgetItem, QWidget, QLineEdit,
 )
 
 from core.modbus_client import ModbusClient
@@ -11,6 +14,8 @@ from theme import apply_dropdown_delegate
 # timeout is configured -- mirrors the Script tab's MIN_STEP_INTERVAL_MS and the
 # Network Scanner's 50ms IP-probe delay: a fast timeout shouldn't turn into flooding.
 PROBE_DELAY_MS = 20
+_ACTIVE_SCAN_PORTS = set()
+_SCAN_PORT_LOCK = Lock()
 
 
 def modbus_rtu_t35_ms(baud):
@@ -27,7 +32,7 @@ def modbus_rtu_t35_ms(baud):
 # Common serial settings to sweep -- byte size is deliberately not swept, since 8 data
 # bits is the near-universal default and a fourth dimension would multiply the already
 # large combination count for little benefit.
-BAUD_RATES_TO_TRY = [1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200]
+BAUD_RATES_TO_TRY = [600, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 76800, 115200]
 PARITIES_TO_TRY = ["N", "E", "O"]
 STOPBITS_TO_TRY = [1, 2]
 
@@ -36,10 +41,76 @@ STOPBITS_TO_TRY = [1, 2]
 # main_window importing this module already goes the other way.
 PARITY_LABELS = {"N": "None", "E": "Even", "O": "Odd"}
 
-# Fixed probe: a single Holding Register read is supported by virtually every device,
-# and this dialog is only about finding the serial settings, not about registers at all.
-_PROBE_FUNCTION = "Holding Registers"
-_PROBE_ADDRESS = 0
+PROBE_FUNCTIONS = {"Holding Registers (FC03)": "holding", "Input Registers (FC04)": "input"}
+
+
+def parse_baud_rates(text):
+    """Preserve the requested order and remove duplicate baud rates."""
+    try:
+        rates = list(dict.fromkeys(int(value.strip()) for value in text.split(",")))
+    except ValueError:
+        raise ValueError("Baud rates must be comma-separated whole numbers.") from None
+    if not rates or any(rate < 50 or rate > 4000000 for rate in rates):
+        raise ValueError("Enter baud rates between 50 and 4000000; adapter support varies.")
+    return rates
+
+
+def serial_probe_timeout(baud, parity, stopbits, framer, reply_wait):
+    """Allow one request and one-register response to cross the wire before timing out.
+
+    A serial write may return while its bytes are still transmitting. At 600 baud,
+    request/response wire time alone exceeds the usual 200ms device reply wait.
+    """
+    characters = 32 if framer == "ascii" else 15  # ASCII 17+15; RTU 8+7 bytes
+    bits_per_character = 1 + 8 + (parity != "N") + stopbits
+    silence = 0 if framer == "ascii" else modbus_rtu_t35_ms(baud) / 1000
+    return reply_wait + characters * bits_per_character / baud + silence
+
+
+class SerialScanOptions(QWidget):
+    """The same read-only probe controls in Serial Discovery and Find Devices."""
+
+    def __init__(self, parent_window):
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Baud rates:"))
+        self.baud_input = QLineEdit(", ".join(str(rate) for rate in BAUD_RATES_TO_TRY))
+        self.baud_input.setStyleSheet(parent_window._get_input_style())
+        self.baud_input.setToolTip("Comma-separated baud rates, tried in this order. All N/E/O parity and 1/2 stop-bit settings are tested.")
+        row.addWidget(self.baud_input)
+        layout.addLayout(row)
+        row = QHBoxLayout()
+        self.function_combo = QComboBox()
+        self.function_combo.addItems(PROBE_FUNCTIONS)
+        self.function_combo.setStyleSheet(parent_window._get_input_style())
+        apply_dropdown_delegate(self.function_combo, getattr(parent_window, "_theme_mode", "light"))
+        row.addWidget(self.function_combo)
+        row.addWidget(QLabel("PDU address:"))
+        self.address_input = QSpinBox()
+        self.address_input.setRange(0, 65535)
+        self.address_input.setStyleSheet(parent_window._get_input_style())
+        self.address_input.setToolTip("Zero-based wire address. For example, conventional holding register 40001 is address 0.")
+        row.addWidget(self.address_input)
+        row.addWidget(QLabel("Confirm replies:"))
+        self.confirmations_input = QSpinBox()
+        self.confirmations_input.setRange(2, 5)
+        self.confirmations_input.setValue(2)
+        self.confirmations_input.setStyleSheet(parent_window._get_input_style())
+        row.addWidget(self.confirmations_input)
+        layout.addLayout(row)
+        note = QLabel("Read-only probes. A repeated Modbus exception confirms communication, not readable register data.")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+    def scan_options(self):
+        return {
+            "baud_rates": parse_baud_rates(self.baud_input.text()),
+            "probe_function": PROBE_FUNCTIONS[self.function_combo.currentText()],
+            "probe_address": self.address_input.value(),
+            "confirmation_count": self.confirmations_input.value(),
+        }
 
 
 def detect_serial_ports():
@@ -62,67 +133,144 @@ class SerialParamScanWorker(QThread):
     same port open."""
 
     combo_matched = Signal(int, str, int, int)  # baud, parity, stopbits, unit_id
+    combo_evidence = Signal(dict)
     progress = Signal(int)
     output = Signal(str)
     scan_complete = Signal(int)  # matches found
 
-    def __init__(self, serial_port, framer, start_unit, end_unit, per_trial_timeout):
+    def __init__(self, serial_port, framer, start_unit, end_unit, per_trial_timeout,
+                 probe_function="holding", probe_address=0, confirmation_count=2, baud_rates=None):
         super().__init__()
+        if not 1 <= start_unit <= end_unit <= 247:
+            raise ValueError("Serial Unit IDs must be between 1 and 247 (0 is broadcast).")
+        if probe_function not in ("holding", "input") or not 0 <= probe_address <= 65535:
+            raise ValueError("Choose FC03/FC04 and a PDU address between 0 and 65535.")
+        if not 2 <= confirmation_count <= 5 or per_trial_timeout <= 0:
+            raise ValueError("Use 2 to 5 confirmation replies and a positive timeout.")
         self.serial_port = serial_port
         self.framer = framer
         self.start_unit = start_unit
         self.end_unit = end_unit
         self.per_trial_timeout = per_trial_timeout
+        self.probe_function = probe_function
+        self.probe_address = probe_address
+        self.confirmation_count = confirmation_count
+        self.baud_rates = parse_baud_rates(",".join(str(rate) for rate in (BAUD_RATES_TO_TRY if baud_rates is None else baud_rates)))
         self.should_stop = False
 
     def stop(self):
         self.should_stop = True
 
     def run(self):
+        port_key = self.serial_port.strip().casefold()
+        with _SCAN_PORT_LOCK:
+            busy = port_key in _ACTIVE_SCAN_PORTS
+            if not busy:
+                _ACTIVE_SCAN_PORTS.add(port_key)
+        if busy:
+            self.output.emit(f"A serial discovery scan is already running on {self.serial_port}. Stop it first.")
+            self.scan_complete.emit(0)
+            return
         combos = [
             (baud, parity, stopbits, unit_id)
-            for baud in BAUD_RATES_TO_TRY
+            for baud in self.baud_rates
             for parity in PARITIES_TO_TRY
             for stopbits in STOPBITS_TO_TRY
             for unit_id in range(self.start_unit, self.end_unit + 1)
         ]
         total = len(combos)
         matches = 0
-
-        for i, (baud, parity, stopbits, unit_id) in enumerate(combos):
-            if self.should_stop:
-                break
-            label = f"{baud} baud, parity={parity}, stop bits={stopbits}, Unit {unit_id}"
-            client = ModbusClient(
-                unit_id=unit_id, timeout=self.per_trial_timeout, retries=0,
-                mode="serial", serial_port=self.serial_port, baudrate=baud,
-                parity=parity, stopbits=stopbits, bytesize=8, serial_framer=self.framer,
-            )
-            if not client.connect():
-                # The port itself couldn't be opened at all -- likely already held open
-                # by ModbusLens's own connection or another program. No combination can
-                # work until that's resolved, so stop instead of repeating the same
-                # failure for every remaining combo.
-                self.output.emit(
-                    f"Could not open {self.serial_port}: {client.last_error or 'unknown error'}. "
-                    f"Make sure nothing else (including a connected ModbusLens device) has this "
-                    f"port open, then try again."
+        aborted = False
+        failed_settings = set()
+        opened_any = False
+        try:
+            for i, (baud, parity, stopbits, unit_id) in enumerate(combos):
+                if self.should_stop:
+                    break
+                setting = (baud, parity, stopbits)
+                if setting in failed_settings:
+                    self.progress.emit(int((i + 1) / total * 100))
+                    continue
+                label = f"{baud} baud, parity={parity}, stop bits={stopbits}, Unit {unit_id}"
+                client = ModbusClient(
+                    unit_id=unit_id, timeout=serial_probe_timeout(
+                        baud, parity, stopbits, self.framer, self.per_trial_timeout), retries=0,
+                    mode="serial", serial_port=self.serial_port, baudrate=baud,
+                    parity=parity, stopbits=stopbits, bytesize=8, serial_framer=self.framer,
                 )
-                break
+                evidence = None
+                try:
+                    if not client.connect():
+                        failed_settings.add(setting)
+                        self.output.emit(
+                            f"Skipping {baud}/{parity}/8/{stopbits}: could not open {self.serial_port}: "
+                            f"{client.last_error or 'unknown error'}."
+                        )
+                    else:
+                        opened_any = True
+                        evidence = self._confirm_probe(client, baud)
+                finally:
+                    client.disconnect()
+                if evidence and not self.should_stop:
+                    matches += 1
+                    evidence.update(serial_port=self.serial_port, framer=self.framer,
+                                    baudrate=baud, parity=parity, stopbits=stopbits, unit_id=unit_id)
+                    self.combo_matched.emit(baud, parity, stopbits, unit_id)
+                    self.combo_evidence.emit(evidence)
+                    self.output.emit(f"  {evidence['summary']}: {label}; FC{evidence['function_code']:02d} "
+                                     f"address {self.probe_address}; TX {evidence['tx_hex'] or '(not captured)'}; "
+                                     f"RX {evidence['rx_hex'] or '(not captured)'}")
+                self.progress.emit(int((i + 1) / total * 100))
+                self._probe_pause(baud)
+            if not opened_any and not self.should_stop:
+                aborted = True
+                self.output.emit("No serial settings could be opened. Check port access and adapter support.")
+        except Exception as exc:
+            aborted = True
+            self.output.emit(f"Scan failed: {exc}")
+        finally:
+            with _SCAN_PORT_LOCK:
+                _ACTIVE_SCAN_PORTS.discard(port_key)
+            self.output.emit("Scan stopped." if self.should_stop else "Scan aborted." if aborted else "Scan complete.")
+            self.scan_complete.emit(matches)
 
-            result = client.read_registers(_PROBE_ADDRESS, 1)
-            present = result is not None or client.last_exception_code is not None
-            client.disconnect()
-            if present:
-                matches += 1
-                self.combo_matched.emit(baud, parity, stopbits, unit_id)
-                self.output.emit(f"  MATCH: {label}")
+    def _probe_pause(self, baud):
+        self.msleep(ceil(max(PROBE_DELAY_MS, modbus_rtu_t35_ms(baud))))
 
-            self.progress.emit(int((i + 1) / total * 100))
-            self.msleep(int(round(max(PROBE_DELAY_MS, modbus_rtu_t35_ms(baud)))))
-
-        self.output.emit("Scan stopped." if self.should_stop else "Scan complete.")
-        self.scan_complete.emit(matches)
+    def _confirm_probe(self, client, baud):
+        data_replies, exception_codes = 0, []
+        registers = []
+        for attempt in range(self.confirmation_count):
+            if self.should_stop:
+                return None
+            read = client.read_registers if self.probe_function == "holding" else client.read_input_registers
+            result = read(self.probe_address, 1)
+            # pymodbus validates frame CRC/LRC, unit and function; ModbusClient's reply
+            # guard also rejects the wrong register count. Raw RX alone is not proof.
+            if (isinstance(result, (list, tuple)) and len(result) == 1
+                    and type(result[0]) is int and 0 <= result[0] <= 65535):
+                data_replies += 1
+                registers = list(result)
+            elif (client.last_error_category == "device_exception"
+                  and client.last_exception_code is not None):
+                exception_codes.append(client.last_exception_code)
+            else:
+                if attempt:
+                    self.output.emit(f"  Unconfirmed reply: {attempt}/{self.confirmation_count} valid responses; "
+                                     f"{client.last_error or 'no valid reply'}")
+                return None
+            if attempt + 1 < self.confirmation_count:
+                self._probe_pause(baud)
+        summary = (f"Readable data ({data_replies}/{self.confirmation_count} replies)"
+                   if data_replies == self.confirmation_count else
+                   f"Protocol replies ({data_replies} data, exceptions {','.join(map(str, exception_codes))})")
+        return {
+            "probe_address": self.probe_address, "function_code": 3 if self.probe_function == "holding" else 4,
+            "confirmations": self.confirmation_count, "data_replies": data_replies,
+            "registers": registers, "exception_codes": exception_codes, "summary": summary,
+            "tx_hex": (client.last_tx_bytes or b"").hex(" ").upper(),
+            "rx_hex": (client.last_rx_bytes or b"").hex(" ").upper(),
+        }
 
 
 class SerialDiscoveryDialog:
@@ -151,7 +299,7 @@ class SerialDiscoveryDialog:
         c = self.parent._colors()
         self.dialog = QDialog(self.parent)
         self.dialog.setWindowTitle("Serial Discovery")
-        self.dialog.setGeometry(300, 300, 620, 520)
+        self.dialog.setGeometry(300, 300, 780, 630)
         self.dialog.closeEvent = self._on_dialog_close
 
         layout = QVBoxLayout(self.dialog)
@@ -177,24 +325,27 @@ class SerialDiscoveryDialog:
         row2.addWidget(QLabel("Start Unit ID:"))
         self.start_unit_input = QSpinBox()
         self.start_unit_input.setStyleSheet(self.parent._get_input_style())
-        self.start_unit_input.setRange(0, 255)
+        self.start_unit_input.setRange(1, 247)
         self.start_unit_input.setValue(1)
         row2.addWidget(self.start_unit_input)
 
         row2.addWidget(QLabel("End Unit ID:"))
         self.end_unit_input = QSpinBox()
         self.end_unit_input.setStyleSheet(self.parent._get_input_style())
-        self.end_unit_input.setRange(0, 255)
+        self.end_unit_input.setRange(1, 247)
         self.end_unit_input.setValue(1)
         row2.addWidget(self.end_unit_input)
 
-        row2.addWidget(QLabel("Per-trial timeout (ms):"))
+        row2.addWidget(QLabel("Reply wait (ms):"))
         self.timeout_input = QSpinBox()
         self.timeout_input.setStyleSheet(self.parent._get_input_style())
         self.timeout_input.setRange(50, 2000)
         self.timeout_input.setValue(200)
+        self.timeout_input.setToolTip("Device response allowance. Request/reply wire time is added automatically, especially for low baud rates.")
         row2.addWidget(self.timeout_input)
         layout.addLayout(row2)
+        self.scan_options = SerialScanOptions(self.parent)
+        layout.addWidget(self.scan_options)
 
         row3 = QHBoxLayout()
         row3.addStretch()
@@ -261,7 +412,7 @@ class SerialDiscoveryDialog:
         button_row.addStretch()
         close_btn = QPushButton("Close")
         close_btn.setStyleSheet(self.parent._get_button_style())
-        close_btn.clicked.connect(self.dialog.hide)
+        close_btn.clicked.connect(self.dialog.close)
         button_row.addWidget(close_btn)
         layout.addLayout(button_row)
 
@@ -293,8 +444,14 @@ class SerialDiscoveryDialog:
             self.output_text.append("Start Unit ID must not be greater than End Unit ID.")
             return
 
+        try:
+            options = self.scan_options.scan_options()
+        except ValueError as exc:
+            self.output_text.append(str(exc))
+            return
+
         total_combos = (
-            len(BAUD_RATES_TO_TRY) * len(PARITIES_TO_TRY) * len(STOPBITS_TO_TRY)
+            len(options["baud_rates"]) * len(PARITIES_TO_TRY) * len(STOPBITS_TO_TRY)
             * (end_unit - start_unit + 1)
         )
         self.output_text.append(f"Scanning serial settings on {port} ({total_combos} combination(s))...")
@@ -305,40 +462,56 @@ class SerialDiscoveryDialog:
         self.progress_bar.setValue(0)
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
+        self._set_inputs_enabled(False)
 
         self.worker = SerialParamScanWorker(
             port, self.framer_combo.currentText().lower(), start_unit, end_unit,
-            self.timeout_input.value() / 1000.0,
+            self.timeout_input.value() / 1000.0, **options,
         )
-        self.worker.combo_matched.connect(self._on_combo_matched)
+        self.worker.combo_evidence.connect(self._on_combo_evidence)
         self.worker.progress.connect(self.progress_bar.setValue)
         self.worker.output.connect(self.output_text.append)
         self.worker.scan_complete.connect(self._on_scan_complete)
         self.worker.start()
 
-    def _on_combo_matched(self, baud, parity, stopbits, unit_id):
-        port = self.port_combo.currentText().strip()
-        framer_value = self.framer_combo.currentText().lower()
+    def _set_inputs_enabled(self, enabled):
+        for widget in (self.port_combo, self.framer_combo, self.start_unit_input,
+                       self.end_unit_input, self.timeout_input, self.scan_options):
+            widget.setEnabled(enabled)
+
+    def _on_combo_evidence(self, evidence):
+        port, framer_value = evidence["serial_port"], evidence["framer"]
+        baud, parity, stopbits, unit_id = (evidence[key] for key in ("baudrate", "parity", "stopbits", "unit_id"))
         parity_label = PARITY_LABELS.get(parity, parity)
         item = QListWidgetItem(
             f"{port} @ {baud} baud ({parity_label} parity, 8/{stopbits}, "
-            f"{self.framer_combo.currentText()}, Unit {unit_id})"
+            f"{framer_value.upper()}, Unit {unit_id}) — {evidence['summary']}"
         )
         item.setData(Qt.UserRole, (port, baud, parity, stopbits, unit_id, framer_value))
+        item.setData(Qt.UserRole + 1, evidence)
+        item.setToolTip(f"FC{evidence['function_code']:02d}, PDU address {evidence['probe_address']}; "
+                        f"registers {evidence['registers']}; TX {evidence['tx_hex']}; RX {evidence['rx_hex']}")
         self.matches_list.addItem(item)
         self.export_btn.setEnabled(True)
 
     def _export_matches_csv(self):
         rows = []
         for i in range(self.matches_list.count()):
-            port, baud, parity, stopbits, unit_id, framer = self.matches_list.item(i).data(Qt.UserRole)
-            rows.append([port, baud, PARITY_LABELS.get(parity, parity), stopbits, framer.upper(), unit_id])
+            item = self.matches_list.item(i)
+            port, baud, parity, stopbits, unit_id, framer = item.data(Qt.UserRole)
+            evidence = item.data(Qt.UserRole + 1)
+            rows.append([port, baud, PARITY_LABELS.get(parity, parity), stopbits, framer.upper(), unit_id,
+                         evidence["summary"], evidence["function_code"], evidence["probe_address"],
+                         evidence["confirmations"], evidence["registers"], evidence["exception_codes"],
+                         evidence["tx_hex"], evidence["rx_hex"]])
         if not rows:
             return
         from gui.csv_export import export_rows_csv
         export_rows_csv(
             self.dialog, "Export Serial Discovery Matches", "serial_matches",
-            ["Port", "Baud Rate", "Parity", "Stop Bits", "Framing", "Unit ID"], rows,
+            ["Port", "Baud Rate", "Parity", "Stop Bits", "Framing", "Unit ID", "Evidence",
+             "Function Code", "PDU Address", "Confirmed Replies", "Last Data Registers", "Exception Codes",
+             "Last TX Hex", "Last RX Hex"], rows,
             log=getattr(self.parent, "_log", None),
         )
 
@@ -353,6 +526,7 @@ class SerialDiscoveryDialog:
         if item is None:
             return
         port, baud, parity, stopbits, unit_id, framer = item.data(Qt.UserRole)
+        self.stop_all_scans()
         self.dialog.hide()
         self.parent._show_connection_settings(serial_overrides={
             "serial_port": port,
@@ -368,10 +542,11 @@ class SerialDiscoveryDialog:
             self.worker.stop()
 
     def _on_scan_complete(self, matches_found):
-        self.output_text.append(f"Summary: {matches_found} working combination(s) found.")
+        self.output_text.append(f"Summary: {matches_found} combination(s) with repeated valid replies; see data/exception evidence.")
         self.progress_bar.setVisible(False)
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self._set_inputs_enabled(True)
 
     def stop_all_scans(self):
         """Called when the main window is closing (or the dialog itself is), so an
